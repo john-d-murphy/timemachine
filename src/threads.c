@@ -1,5 +1,6 @@
 /*
  *  Copyright (C) 2004 Steve Harris
+ *  Copyright (C) 2026 John D. Murphy
  *
  *  This program is free software; you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License as published by
@@ -10,309 +11,311 @@
  *  but WITHOUT ANY WARRANTY; without even the implied warranty of
  *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
  *  GNU General Public License for more details.
- *
- *  $Id: threads.c,v 1.5 2005/01/22 17:17:39 swh Exp $
  */
 
+#include "threads.h"
+
+#include <gtk/gtk.h>
+#include <jack/jack.h>
 #include <math.h>
+#include <sndfile.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <stdio.h>
-#include <unistd.h>
 #include <time.h>
-#include <sndfile.h>
-#include <jack/jack.h>
-#include <gtk/gtk.h>
+#include <unistd.h>
 
 #include "config.h"
-#include "support.h"
 #include "main.h"
-#include "threads.h"
 #include "meters.h"
+#include "support.h"
 
-#define BUF_SIZE 4096
+//| @region ring-buffer
+//| Single circular buffer per port, always written by the RT thread.
+//| ring_head is monotonic — never wraps. Readers compute ring_head % ring_size.
+//| This replaces the original two-buffer model (pre_buffer + disk_buffer)
+//| where pre_buffer was written when idle and disk_buffer when recording.
+//| The old model cleared pre_buffer on capture (memset to 0) and required
+//| a recording state machine. This model has no state — the buffer is
+//| always rolling and capture is a non-destructive snapshot.
+static float* ring[MAX_PORTS];
+static unsigned int ring_size;          /* in frames, = buf_length * sr */
+static volatile unsigned int ring_head; /* monotonic, written by RT only */
+//| @end
 
-float *pre_buffer[MAX_PORTS];
-float *disk_buffer[MAX_PORTS];
-
-static int recording = 0;	    /* recording yes/no */
-static int user_recording = 0;	    /* recording initiated by user yes/no */
-static int quiting = 0;		    /* quit pending yes/no */
-volatile int recording_done = 0;    /* recording completed after quit */
-volatile int need_ui_sync = 0;      /* need to update record button */
-
-static unsigned int pre_time = 0;
-static unsigned int pre_size = 0;
-static unsigned int pre_pos = 0;
-static unsigned int disk_read_pos = 0;
-static unsigned int disk_write_pos = 0;
+//| @region capture-state
+//| Capture is request-based: the control thread sets capture_seconds and
+//| then capture_pending. The writer thread wakes, snapshots ring_head,
+//| and dumps the last capture_seconds of audio. The ring keeps rolling
+//| during the write — nothing is cleared, nothing blocks.
+static volatile int capture_pending = 0;
+static unsigned int capture_seconds = 0;
+static volatile int quiting = 0;
+volatile int capture_done = 0;
+volatile int need_ui_sync = 0;
+//| @end
 
 /* Peak data for meters */
 static volatile float peak[MAX_PORTS];
 
-static unsigned int silent_count = 0;
+//| @region process-callback
+//| JACK RT callback. Unconditionally writes all input into the ring.
+//| No branching on recording state — the ring is always hot.
+int process(jack_nframes_t nframes, void* arg) {
+  unsigned int i, port;
+  unsigned int pos = ring_head;
 
-int process(jack_nframes_t nframes, void *arg)
-{
-    unsigned int i, port, pos = 0;
-    const unsigned int rec = recording;
-    const jack_nframes_t sample_rate = jack_get_sample_rate(client);
+  for (port = 0; port < num_ports; port++) {
+    jack_default_audio_sample_t* in;
 
-    for (port = 0; port < num_ports; port++) {
-	jack_default_audio_sample_t *in;
-
-	/* just incase the port isn't registered yet */
-	if (ports[port] == NULL) {
-	    break;
-	}
-
-	in = (jack_default_audio_sample_t *)
-	    jack_port_get_buffer(ports[port], nframes);
-
-	if (!in) {
-	    fprintf(stderr, "bad buffer!\n");
-	    break;
-	}
-
-	if (auto_record) {
-	    if (rec && !user_recording) {
-		for (i = 0; i < nframes; i++) {
-		    if (fabsf(in[i]) <= auto_end_threshold) {
-			silent_count++;
-		    } else {
-			silent_count = 0;
-		    }
-		}
-		if (silent_count > (auto_end_time * sample_rate * num_ports)) {
-		    recording = 0;
-		}
-	    } else {
-		for (i = 0; i < nframes; i++) {
-		    if (fabsf(in[i]) > auto_begin_threshold) {
-			recording = 1;
-			silent_count = 0;
-			break;
-		    }
-		}
-	    }
-	}
-
-	for (i = 0; i < nframes; i++) {
-	    if (fabsf(in[i]) > peak[port]) {
-		peak[port] = fabsf(in[i]);
-	    }
-	}
-
-	if (rec) {
-	    pos = disk_write_pos;
-	    for (i = 0; i < nframes; i++) {
-		disk_buffer[port][pos] = in[i];
-		pos = (pos + 1) & (DISK_SIZE - 1);
-	    }
-	} else {
-	    pos = pre_pos;
-	    for (i = 0; i < nframes; i++) {
-		pre_buffer[port][pos++] = in[i];
-		if (pos > pre_size) {
-		    pos = 0;
-		}
-	    }
-	}
-    }
-    if (rec) {
-	disk_write_pos = (disk_write_pos + nframes) & (DISK_SIZE - 1);
-    } else {
-	pre_pos = pos;
+    /* port may not be registered yet during startup */
+    if (ports[port] == NULL) {
+      break;
     }
 
-    return 0;
+    in = (jack_default_audio_sample_t*)jack_port_get_buffer(ports[port],
+                                                            nframes);
+
+    if (!in) {
+      fprintf(stderr, "timemachine: bad buffer on port %u\n", port);
+      break;
+    }
+
+    /* write into ring at current head position */
+    for (i = 0; i < nframes; i++) {
+      ring[port][(pos + i) % ring_size] = in[i];
+    }
+
+    /* update peak for meters */
+    for (i = 0; i < nframes; i++) {
+      if (fabsf(in[i]) > peak[port]) {
+        peak[port] = fabsf(in[i]);
+      }
+    }
+  }
+
+  /* advance head — monotonic, never wraps */
+  ring_head = pos + nframes;
+
+  return 0;
 }
+//| @end
 
-int writer_thread(void *d)
-{
-    unsigned int i, j, k, opos;
-    char *filename;
-    SNDFILE *out;
-    SF_INFO info;
-    float buf[BUF_SIZE * MAX_PORTS];
-    time_t t;
-    struct tm *parts;
+//| @region writer-thread
+//| Disk writer thread. Sleeps until capture_pending is set, then
+//| snapshots the ring head, computes the lookback window, and dumps
+//| the interleaved audio to a WAV file. The ring keeps rolling during
+//| the write. The only constraint is capture_seconds <= buf_length
+//| so the RT thread can't overwrite data we're still reading.
+int writer_thread(void* d) {
+  unsigned int i, j, port;
+  char* filename;
+  SNDFILE* out;
+  SF_INFO info;
+  float buf[BUF_SIZE * MAX_PORTS];
+  time_t t;
+  struct tm* parts;
 
-  again:
-    while (!recording && !quiting) {
-	usleep(100);
+again:
+  /* sleep until a capture is requested or we're quiting */
+  while (!capture_pending && !quiting) {
+    usleep(1000);
+  }
 
-    }
-    if (quiting) {
-	recording_done = 1;
+  if (quiting) {
+    capture_done = 1;
+    return 0;
+  }
 
-	return 0;
-    }
+  /* snapshot the current ring position */
+  unsigned int head = ring_head;
+  unsigned int sr = jack_get_sample_rate(client);
 
-    /* Find the ISO 8601 date string for the time of the start of the
-     * buffer */
-    time(&t);
-    t -= pre_time;
-    parts = localtime(&t);
-    if (safe_filename) {
-	filename = g_strdup_printf("%s%04d-%02d-%02dT%02d-%02d-%02d.%s",
-	     prefix,
-	     parts->tm_year + 1900, parts->tm_mon + 1, parts->tm_mday,
-	     parts->tm_hour, parts->tm_min, parts->tm_sec, format_name);
-    } else {
-	filename = g_strdup_printf("%s%04d-%02d-%02dT%02d:%02d:%02d.%s",
-	     prefix,
-	     parts->tm_year + 1900, parts->tm_mon + 1, parts->tm_mday,
-	     parts->tm_hour, parts->tm_min, parts->tm_sec, format_name);
-    }
+  /* clamp capture to available data */
+  unsigned int frames = capture_seconds * sr;
+  if (frames > ring_size) {
+    frames = ring_size;
+  }
+  /* don't capture more than we've actually recorded */
+  if (frames > head) {
+    frames = head;
+  }
 
-    /* Open the output file */
-    info.samplerate = jack_get_sample_rate(client);
-    info.channels = num_ports;
+  unsigned int start = head - frames;
 
-    info.format = format_sf;
-    if (!sf_format_check(&info)) {
-	fprintf(stderr, PACKAGE ": output file format error\n");
-    }
+  /* ISO 8601 timestamp backdated to the start of the capture window */
+  time(&t);
+  t -= (time_t)capture_seconds;
+  parts = localtime(&t);
 
-    out = sf_open(filename, SFM_WRITE, &info);
-    if (!out) {
-	perror("cannot open file for writing");
-	goto again;
-    }
+  if (safe_filename) {
+    filename = g_strdup_printf("%s%04d-%02d-%02dT%02d-%02d-%02d.%s", prefix,
+                               parts->tm_year + 1900, parts->tm_mon + 1,
+                               parts->tm_mday, parts->tm_hour, parts->tm_min,
+                               parts->tm_sec, format_name);
+  } else {
+    filename = g_strdup_printf("%s%04d-%02d-%02dT%02d:%02d:%02d.%s", prefix,
+                               parts->tm_year + 1900, parts->tm_mon + 1,
+                               parts->tm_mday, parts->tm_hour, parts->tm_min,
+                               parts->tm_sec, format_name);
+  }
 
-    printf("opened '%s'\n", filename);
-    printf("writing buffer...\n");
+  /* open output file */
+  info.samplerate = sr;
+  info.channels = num_ports;
+  info.format = format_sf;
+
+  if (!sf_format_check(&info)) {
+    fprintf(stderr, "timemachine: output file format error\n");
+  }
+
+  out = sf_open(filename, SFM_WRITE, &info);
+  if (!out) {
+    fprintf(stderr, "timemachine: cannot open '%s' for writing: %s\n", filename,
+            sf_strerror(NULL));
     free(filename);
-
-    /* Dump the pre buffer to disk as fast was we can */
-    i = 0;
-    while (i < pre_size) {
-	for (j = 0; j < BUF_SIZE && i < pre_size; i++, j++) {
-	    for (k = 0; k < num_ports; k++) {
-		buf[j * num_ports + k] =
-		    pre_buffer[k][(i + pre_pos) % pre_size];
-	    }
-	}
-	sf_writef_float(out, buf, j);
-    }
-
-    /* Clear the pre buffer so we dont get stale data in it */
-    for (i = 0; i < num_ports; i++) {
-	memset(pre_buffer[i], 0, pre_size * sizeof(float));
-    }
-
-    /* This tells the UI that were ready to go again, it will reset it */
+    capture_pending = 0;
     need_ui_sync = 1;
+    goto again;
+  }
 
-    if (recording) printf("writing realtime data...\n");
+  printf("capturing %u seconds -> '%s'\n", capture_seconds, filename);
 
-    /* Start writing the RT ringbuffer to disk */
-    opos = 0;
-    while (recording) {
-	for (i = disk_read_pos; i != disk_write_pos && opos < BUF_SIZE;
-	     i = (i + 1) & (DISK_SIZE - 1), opos++) {
-	    for (j = 0; j < num_ports; j++) {
-		buf[opos * num_ports + j] = disk_buffer[j][i];
-	    }
-	}
-	sf_writef_float(out, buf, opos);
-	disk_read_pos = i;
-	opos = 0;
-	usleep(10);
+  /* dump the lookback window in chunks */
+  unsigned int written = 0;
+  while (written < frames) {
+    unsigned int chunk = BUF_SIZE;
+    if (written + chunk > frames) {
+      chunk = frames - written;
     }
-    sf_close(out);
 
-    need_ui_sync = 1;
+    /* interleave ports into the write buffer */
+    for (i = 0; i < chunk; i++) {
+      for (port = 0; port < num_ports; port++) {
+        buf[i * num_ports + port] =
+            ring[port][(start + written + i) % ring_size];
+      }
+    }
 
-    printf("done writing...\n");
+    j = sf_writef_float(out, buf, chunk);
+    if (j != chunk) {
+      fprintf(stderr, "timemachine: short write (%u of %u frames)\n", j, chunk);
+      break;
+    }
+    written += chunk;
+  }
 
-    /* Just make sure everythings reset */
-    disk_read_pos = disk_write_pos;
+  sf_close(out);
+  printf("captured %u frames (%u seconds) -> '%s'\n", written, capture_seconds,
+         filename);
+  free(filename);
 
-    /* Ugh, I'm sorry */
-    if (!quiting) goto again;
+  /* signal completion */
+  capture_pending = 0;
+  need_ui_sync = 1;
 
-    recording_done = 1;
+  if (!quiting) goto again;
 
-    return 0;
+  capture_done = 1;
+  return 0;
+}
+//| @end
+
+//| @region init
+//| Allocate the ring buffer. Size is buf_length * sample_rate frames
+//| per port. Unlike the original code, there is only one buffer — no
+//| separate pre_buffer and disk_buffer.
+void process_init(unsigned int time) {
+  unsigned int port;
+
+  if (time < 1) {
+    fprintf(stderr,
+            "timemachine: buffer time must be 1 second or "
+            "greater\n");
+    exit(1);
+  }
+  if (time > MAX_TIME) {
+    fprintf(stderr,
+            "timemachine: buffer time must be %d seconds or "
+            "less\n",
+            MAX_TIME);
+    exit(1);
+  }
+
+  ring_size = time * jack_get_sample_rate(client);
+  ring_head = 0;
+
+  for (port = 0; port < num_ports; port++) {
+    ring[port] = calloc(ring_size, sizeof(float));
+    if (!ring[port]) {
+      fprintf(stderr,
+              "timemachine: failed to allocate ring buffer "
+              "for port %u (%u frames)\n",
+              port, ring_size);
+      exit(1);
+    }
+  }
+  /* null out unused ports */
+  for (; port < MAX_PORTS; port++) {
+    ring[port] = NULL;
+  }
+
+  printf("ring buffer: %u seconds, %u frames/port, %.1f MB total\n", time,
+         ring_size,
+         (float)ring_size * sizeof(float) * num_ports / (1024 * 1024));
+}
+//| @end
+
+//| @region control
+//| capture_start: request a capture of the last N seconds.
+//| If a capture is already in progress, this is a no-op.
+//| Sets capture_seconds first, then capture_pending (store order
+//| matters for the writer thread on non-x86, but on x86 sequential
+//| stores are not reordered).
+void capture_start(unsigned int seconds) {
+  if (capture_pending) {
+    fprintf(stderr, "timemachine: capture already in progress\n");
+    return;
+  }
+  capture_seconds = seconds ? seconds : buf_length;
+  capture_pending = 1;
 }
 
-void process_init(unsigned int time)
-{
-    unsigned int port;
+void capture_quit(void) { quiting = 1; }
+//| @end
 
-    if (time < 1) {
-	fprintf(stderr, "timemachine: buffer time must be 1 second or "
-			"greater\n");
-	exit(1);
-    }
-    if (time > MAX_TIME) {
-	fprintf(stderr, "timemachine: buffer time must be %d seconds or "
-			"less\nthis is for your own good, it really will not"
-			"work well with buffers that size\n", MAX_TIME);
-	exit(1);
-    }
+//| @region meter-tick
+//| GTK idle callback for peak meters and UI state sync.
+//| In the new model there is no "recording" state — the UI shows
+//| capture-in-progress (busy) or idle (off). The brief "on" flash
+//| on capture completion is handled by the callbacks layer.
+gboolean meter_tick(gpointer user_data) {
+  float data[MAX_PORTS];
+  unsigned int i;
 
-    pre_size = time * jack_get_sample_rate(client);
-    pre_time = time;
+  if (need_ui_sync) {
+    GtkWidget* img = lookup_widget(main_window, "toggle_image");
 
-    for (port = 0; port < num_ports; port++) {
-	pre_buffer[port] = calloc(pre_size, sizeof(float));
-	disk_buffer[port] = calloc(DISK_SIZE, sizeof(float));
+    if (capture_pending) {
+      gtk_image_set_from_pixbuf(GTK_IMAGE(img), img_busy);
+      gtk_window_set_icon(GTK_WINDOW(main_window), icon_on);
+    } else {
+      gtk_image_set_from_pixbuf(GTK_IMAGE(img), img_off);
+      gtk_window_set_icon(GTK_WINDOW(main_window), icon_off);
     }
-    /* just make sure that if we try these ports we will SEGV */
-    for (; port < MAX_PORTS; port++) {
-	pre_buffer[port] = NULL;
-	disk_buffer[port] = NULL;
-    }
+    gtk_widget_set_sensitive(img, TRUE);
+
+    need_ui_sync = 0;
+  }
+
+  for (i = 0; i < MAX_PORTS; i++) {
+    data[i] = peak[i];
+    peak[i] = peak[i] - 0.1f < 0.0f ? 0.0f : peak[i] - 0.1f;
+  }
+  update_meters(data);
+
+  return TRUE;
 }
-
-void recording_start()
-{
-    recording = 1;
-    user_recording = 1;
-}
-
-void recording_stop()
-{
-    recording = 0;
-    user_recording = 0;
-}
-
-void recording_quit()
-{
-    quiting = 1;
-    recording_stop();
-}
-
-gboolean meter_tick(gpointer user_data)
-{
-    float data[MAX_PORTS];
-    unsigned int i;
-
-    if (need_ui_sync) {
-	GtkWidget *img = lookup_widget(main_window, "toggle_image");
-
-	if (recording) {
-	    gtk_image_set_from_pixbuf(GTK_IMAGE(img), img_on);
-	    gtk_window_set_icon(GTK_WINDOW(main_window), icon_on);
-	} else {
-	    gtk_image_set_from_pixbuf(GTK_IMAGE(img), img_off);
-	    gtk_window_set_icon(GTK_WINDOW(main_window), icon_off);
-	}
-	gtk_widget_set_sensitive(img, TRUE);
-
-	need_ui_sync = 0;
-    }
-
-    for (i=0; i<MAX_PORTS; i++) {
-	data[i] = peak[i];
-	peak[i] = peak[i] - 0.1f < 0.0f ? 0.0f : peak[i] - 0.1f;
-    }
-    update_meters(data);
-
-    return TRUE;
-}
+//| @end
 
 /* vi:set ts=8 sts=4 sw=4: */
